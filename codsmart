@@ -1,0 +1,1245 @@
+// =============================================================================
+// ESP32 SMARTBOX - VERSÃO OTIMIZADA E ESTÁVEL COM GERENCIAMENTO DE CONFIGURAÇÕES
+// Servidor web com SD Card, backup por email e modo de configuração
+// Compatível com ESP32 Core 3.x
+// Nova funcionalidade: Gerenciamento completo de configurações via API
+// =============================================================================
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <ESP_Mail_Client.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// =============================================================================
+// DEFINIÇÕES DE HARDWARE
+// =============================================================================
+#define BUTTON_PIN 13           // Botão para backup email
+#define CONFIG_BUTTON_PIN 27    // Botão para modo configuração (3s)
+#define SD_CS 5                 // Chip Select do SD Card
+#define LED_BUILTIN 2           // LED indicador
+
+// =============================================================================
+// CONFIGURAÇÕES DE PERFORMANCE
+// =============================================================================
+#define FILE_BUFFER_SIZE 8192       // Buffer 8KB para leitura de arquivos
+#define WIFI_TIMEOUT_MS 15000       // Timeout WiFi 15s
+#define DEBOUNCE_DELAY 50           // Debounce 50ms
+#define CACHE_SIZE 3                // Cache de 3 arquivos
+
+// =============================================================================
+// VALORES PADRÃO DE FÁBRICA
+// =============================================================================
+const char* DEFAULT_ETH_IP = "0.0.0.0";
+const char* DEFAULT_WIFI_SSID = "Suarede_aqui";
+const char* DEFAULT_WIFI_PASSWORD = "12345678";
+const char* DEFAULT_EMAIL_BACKUP = "seu@email.com";
+const char* DEFAULT_LINK_BACKUP = "https://drive.google.com/drive/my-drive";
+const char* DEFAULT_EMAIL_SENDER = "seu@email.com";
+const char* DEFAULT_EMAIL_PASSWORD = "senha de app aqui";
+const char* DEFAULT_EMAIL_RECIPIENT = "email_do_destinatario@email.com";
+const char* DEFAULT_SMTP_SERVER = "smtp.gmail.com";
+const int DEFAULT_SMTP_PORT = 587;
+const char* DEFAULT_AUTH_USERNAME = "diego";
+const char* DEFAULT_AUTH_PASSWORD = "12345";
+
+// =============================================================================
+// ESTRUTURAS DE DADOS
+// =============================================================================
+
+// Cache de arquivos para acelerar servidor web
+struct FileCache {
+  String path;
+  String content;
+  String contentType;
+  unsigned long lastAccess;
+  bool valid;
+};
+
+// Estado dos botões com debounce
+struct ButtonState {
+  unsigned long lastDebounceTime;
+  unsigned long pressStartTime;
+  bool lastState;
+  bool pressed;
+};
+
+// Configurações do sistema (carregadas uma vez)
+struct Config {
+  String ethIP;
+  String wifiSSID;
+  String wifiPass;
+  String emailSender;
+  String emailPass;
+  String emailRecipient;
+  String emailBackup;
+  String linkBackup;
+  String emailServer;
+  uint16_t emailPort;
+  String authUser;
+  String authPass;
+  bool loaded;
+};
+
+// =============================================================================
+// VARIÁVEIS GLOBAIS
+// =============================================================================
+
+// Objetos principais
+Preferences preferences;
+WebServer server(80);
+SMTPSession smtp;
+ESP_Mail_Session session;
+SMTP_Message message;
+
+// Configurações e cache
+Config config = {.loaded = false};
+FileCache fileCache[CACHE_SIZE];
+uint8_t fileBuffer[FILE_BUFFER_SIZE];
+
+// Estados
+bool sdInitialized = false;
+bool configModeActive = false;
+ButtonState btnBackup = {0, 0, HIGH, false};
+ButtonState btnConfig = {0, 0, HIGH, false};
+
+// Modo configuração (Access Point)
+const char* CONFIG_AP_SSID = "SmartBox_config_APP";
+const char* CONFIG_AP_PASSWORD = "12345678";
+IPAddress CONFIG_AP_IP(192, 168, 5, 0);
+IPAddress CONFIG_AP_SUBNET(255, 255, 255, 0);
+
+// LED piscante
+unsigned long ledLastToggle = 0;
+const long LED_BLINK_INTERVAL = 500;
+bool ledState = false;
+
+// Arquivos para backup
+const char* jsonFiles[] = {
+  "/WEB/database/cadastros.JSON",
+  "/WEB/database/dados entradas.JSON",
+  "/WEB/database/dados_saidas.JSON",
+  "/WEB/database/gavetas.JSON",
+  "/WEB/database/Operadores.JSON"
+};
+const int totalFiles = 5;
+
+// =============================================================================
+// FUNÇÕES DE CONFIGURAÇÃO
+// =============================================================================
+
+void initCredentials() {
+  Serial.println("[CONFIG] Inicializando credenciais...");
+  
+  // Inicializar credenciais de autenticação
+  preferences.begin("auth", false);
+  if (!preferences.isKey("username")) {
+    preferences.putString("username", DEFAULT_AUTH_USERNAME);
+    preferences.putString("password", DEFAULT_AUTH_PASSWORD);
+    Serial.println("[CONFIG] Auth padrão configurado");
+  }
+  preferences.end();
+  
+  // Inicializar IP Ethernet
+  preferences.begin("ethernet", false);
+  if (!preferences.isKey("ip")) {
+    preferences.putString("ip", DEFAULT_ETH_IP);
+    Serial.println("[CONFIG] Ethernet padrão configurado");
+  }
+  preferences.end();
+  
+  // Inicializar configurações de email
+  preferences.begin("email", false);
+  if (!preferences.isKey("server")) {
+    preferences.putString("sender", DEFAULT_EMAIL_SENDER);
+    preferences.putString("pass", DEFAULT_EMAIL_PASSWORD);
+    preferences.putString("recipient", DEFAULT_EMAIL_RECIPIENT);
+    preferences.putString("server", DEFAULT_SMTP_SERVER);
+    preferences.putUInt("port", DEFAULT_SMTP_PORT);
+    Serial.println("[CONFIG] Email padrão configurado");
+  }
+  preferences.end();
+  
+  // Inicializar configurações de backup
+  preferences.begin("backup", false);
+  if (!preferences.isKey("email")) {
+    preferences.putString("email", DEFAULT_EMAIL_BACKUP);
+    preferences.putString("link", DEFAULT_LINK_BACKUP);
+    Serial.println("[CONFIG] Backup padrão configurado");
+  }
+  preferences.end();
+  
+  // Inicializar configurações WiFi
+  preferences.begin("wifi", false);
+  if (!preferences.isKey("ssid")) {
+    preferences.putString("ssid", DEFAULT_WIFI_SSID);
+    preferences.putString("pass", DEFAULT_WIFI_PASSWORD);
+    Serial.println("[CONFIG] WiFi padrão configurado");
+  }
+  preferences.end();
+}
+
+void loadConfig() {
+  if (config.loaded) return;
+  
+  Serial.println("[CONFIG] Carregando configurações...");
+  
+  // Carregar Ethernet
+  preferences.begin("ethernet", true);
+  config.ethIP = preferences.getString("ip", DEFAULT_ETH_IP);
+  preferences.end();
+  
+  // Carregar WiFi
+  preferences.begin("wifi", true);
+  config.wifiSSID = preferences.getString("ssid", DEFAULT_WIFI_SSID);
+  config.wifiPass = preferences.getString("pass", DEFAULT_WIFI_PASSWORD);
+  preferences.end();
+  
+  // Carregar Email
+  preferences.begin("email", true);
+  config.emailSender = preferences.getString("sender", DEFAULT_EMAIL_SENDER);
+  config.emailPass = preferences.getString("pass", DEFAULT_EMAIL_PASSWORD);
+  config.emailRecipient = preferences.getString("recipient", DEFAULT_EMAIL_RECIPIENT);
+  config.emailServer = preferences.getString("server", DEFAULT_SMTP_SERVER);
+  config.emailPort = preferences.getUInt("port", DEFAULT_SMTP_PORT);
+  preferences.end();
+  
+  // Carregar Backup
+  preferences.begin("backup", true);
+  config.emailBackup = preferences.getString("email", DEFAULT_EMAIL_BACKUP);
+  config.linkBackup = preferences.getString("link", DEFAULT_LINK_BACKUP);
+  preferences.end();
+  
+  // Carregar Auth
+  preferences.begin("auth", true);
+  config.authUser = preferences.getString("username", DEFAULT_AUTH_USERNAME);
+  config.authPass = preferences.getString("password", DEFAULT_AUTH_PASSWORD);
+  preferences.end();
+  
+  config.loaded = true;
+  Serial.println("[CONFIG] Configurações carregadas com sucesso!");
+}
+
+void saveWiFiConfig(const String& ssid, const String& pass) {
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  preferences.end();
+  config.wifiSSID = ssid;
+  config.wifiPass = pass;
+  Serial.println("[CONFIG] WiFi salvo");
+}
+
+void saveEthernetConfig(const String& ip) {
+  preferences.begin("ethernet", false);
+  preferences.putString("ip", ip);
+  preferences.end();
+  config.ethIP = ip;
+  Serial.println("[CONFIG] Ethernet salvo");
+}
+
+void saveEmailConfig(const String& sender, const String& pass, const String& recipient, 
+                     const String& server, uint16_t port) {
+  preferences.begin("email", false);
+  preferences.putString("sender", sender);
+  preferences.putString("pass", pass);
+  preferences.putString("recipient", recipient);
+  preferences.putString("server", server);
+  preferences.putUInt("port", port);
+  preferences.end();
+  
+  config.emailSender = sender;
+  config.emailPass = pass;
+  config.emailRecipient = recipient;
+  config.emailServer = server;
+  config.emailPort = port;
+  Serial.println("[CONFIG] Email SMTP salvo");
+}
+
+void saveBackupConfig(const String& email, const String& link) {
+  preferences.begin("backup", false);
+  preferences.putString("email", email);
+  preferences.putString("link", link);
+  preferences.end();
+  
+  config.emailBackup = email;
+  config.linkBackup = link;
+  Serial.println("[CONFIG] Backup salvo");
+}
+
+void restoreFactoryDefaults() {
+  Serial.println("[CONFIG] Restaurando configurações de fábrica...");
+  
+  // Limpar todas as Preferences
+  preferences.begin("ethernet", false);
+  preferences.clear();
+  preferences.end();
+  
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
+  
+  preferences.begin("email", false);
+  preferences.clear();
+  preferences.end();
+  
+  preferences.begin("backup", false);
+  preferences.clear();
+  preferences.end();
+  
+  preferences.begin("auth", false);
+  preferences.clear();
+  preferences.end();
+  
+  // Reinicializar com valores padrão
+  initCredentials();
+  
+  // Marcar config como não carregada para forçar reload
+  config.loaded = false;
+  loadConfig();
+  
+  Serial.println("[CONFIG] Configurações de fábrica restauradas!");
+}
+
+// =============================================================================
+// FUNÇÕES DE REDE
+// =============================================================================
+
+bool connectWiFi() {
+  Serial.print("[WiFi] Conectando a: ");
+  Serial.println(config.wifiSSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(config.wifiSSID.c_str(), config.wifiPass.c_str());
+  
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && 
+         millis() - startAttempt < WIFI_TIMEOUT_MS) {
+    delay(100);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("[WiFi] Conectado! IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  
+  Serial.println();
+  Serial.println("[WiFi] Falha na conexão");
+  return false;
+}
+
+void startConfigMode() {
+  if (configModeActive) return;
+  
+  Serial.println("[CONFIG] Iniciando modo AP...");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect();
+    delay(500);
+  }
+  
+  WiFi.softAPdisconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_AP);
+  
+  if (!WiFi.softAPConfig(CONFIG_AP_IP, CONFIG_AP_IP, CONFIG_AP_SUBNET)) {
+    Serial.println("[CONFIG] Erro ao configurar IP");
+  }
+  
+  if (WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD)) {
+    Serial.println("[CONFIG] Modo ativo!");
+    Serial.printf("[CONFIG] SSID: %s\n", CONFIG_AP_SSID);
+    Serial.printf("[CONFIG] Senha: %s\n", CONFIG_AP_PASSWORD);
+    Serial.printf("[CONFIG] IP: %s\n", CONFIG_AP_IP.toString().c_str());
+    configModeActive = true;
+  } else {
+    Serial.println("[CONFIG] Falha ao iniciar AP");
+  }
+}
+
+// =============================================================================
+// FUNÇÕES DE SD CARD
+// =============================================================================
+
+bool initSDCard() {
+  if (sdInitialized) return true;
+  
+  if (SD.begin(SD_CS)) {
+    sdInitialized = true;
+    Serial.println("[SD] Inicializado com sucesso");
+    return true;
+  }
+  
+  Serial.println("[SD] Falha na inicialização");
+  return false;
+}
+
+// =============================================================================
+// FUNÇÕES DE CACHE
+// =============================================================================
+
+void initCache() {
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    fileCache[i].valid = false;
+    fileCache[i].lastAccess = 0;
+  }
+}
+
+bool getCachedFile(const String& path, String& content, String& contentType) {
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    if (fileCache[i].valid && fileCache[i].path == path) {
+      fileCache[i].lastAccess = millis();
+      content = fileCache[i].content;
+      contentType = fileCache[i].contentType;
+      return true;
+    }
+  }
+  return false;
+}
+
+void cacheFile(const String& path, const String& content, const String& contentType) {
+  if (content.length() > 10240) return; // Não cachear arquivos >10KB
+  
+  int oldestIdx = 0;
+  unsigned long oldestTime = fileCache[0].lastAccess;
+  
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    if (!fileCache[i].valid) {
+      oldestIdx = i;
+      break;
+    }
+    if (fileCache[i].lastAccess < oldestTime) {
+      oldestTime = fileCache[i].lastAccess;
+      oldestIdx = i;
+    }
+  }
+  
+  fileCache[oldestIdx].path = path;
+  fileCache[oldestIdx].content = content;
+  fileCache[oldestIdx].contentType = contentType;
+  fileCache[oldestIdx].lastAccess = millis();
+  fileCache[oldestIdx].valid = true;
+}
+
+void invalidateCache() {
+  for (int i = 0; i < CACHE_SIZE; i++) {
+    fileCache[i].valid = false;
+  }
+}
+
+// =============================================================================
+// FUNÇÕES DE EMAIL
+// =============================================================================
+
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+}
+
+void sendDatabaseBackupByEmail() {
+  Serial.println("[BACKUP] Iniciando...");
+  
+  if (!initSDCard()) {
+    Serial.println("[BACKUP] Falha: SD não disponível");
+    return;
+  }
+  
+  int filesFound = 0;
+  for (int i = 0; i < totalFiles; i++) {
+    if (SD.exists(jsonFiles[i])) {
+      filesFound++;
+    }
+  }
+  
+  if (filesFound == 0) {
+    Serial.println("[BACKUP] Nenhum arquivo encontrado");
+    return;
+  }
+  
+  Serial.printf("[BACKUP] %d arquivos para enviar\n", filesFound);
+  
+  smtp.debug(1);
+  smtp.callback(smtpCallback);
+  
+  session.server.host_name = config.emailServer.c_str();
+  session.server.port = config.emailPort;
+  session.login.email = config.emailSender.c_str();
+  session.login.password = config.emailPass.c_str();
+  session.login.user_domain = "";
+  
+  message.sender.name = "ESP32 SmartBox";
+  message.sender.email = config.emailSender.c_str();
+  message.subject = "Backup Database SmartBox";
+  message.text.content = "Backup automático dos arquivos JSON.";
+  message.addRecipient("Admin", config.emailRecipient.c_str());
+  
+  for (int i = 0; i < totalFiles; i++) {
+    if (SD.exists(jsonFiles[i])) {
+      SMTP_Attachment att;
+      String filename = String(jsonFiles[i]);
+      int lastSlash = filename.lastIndexOf('/');
+      if (lastSlash >= 0) {
+        filename = filename.substring(lastSlash + 1);
+      }
+      
+      att.descr.filename = filename.c_str();
+      att.descr.mime = "application/json";
+      att.file.path = jsonFiles[i];
+      att.file.storage_type = esp_mail_file_storage_type_sd;
+      message.addAttachment(att);
+    }
+  }
+  
+  Serial.println("[SMTP] Conectando...");
+  
+  if (!smtp.connect(&session)) {
+    Serial.printf("[SMTP] Erro: %s\n", smtp.errorReason().c_str());
+    return;
+  }
+  
+  if (!MailClient.sendMail(&smtp, &message)) {
+    Serial.printf("[SMTP] Falha: %s\n", smtp.errorReason().c_str());
+  } else {
+    Serial.printf("[SMTP] Sucesso! %d arquivos enviados\n", filesFound);
+  }
+  
+  smtp.closeSession();
+}
+
+// =============================================================================
+// HANDLERS DO SERVIDOR WEB
+// =============================================================================
+
+void handleConfigRoot();
+
+void handleRoot() {
+  if (configModeActive) {
+    handleConfigRoot();
+    return;
+  }
+  
+  if (!initSDCard() || !SD.exists("/WEB/Loguin.html")) {
+    server.send(404, "text/plain", "Arquivo não encontrado");
+    return;
+  }
+  
+  server.sendHeader("Cache-Control", "max-age=60");
+  File file = SD.open("/WEB/Loguin.html");
+  server.streamFile(file, "text/html");
+  file.close();
+}
+
+void handleFile() {
+  if (configModeActive) {
+    handleConfigRoot();
+    return;
+  }
+  
+  String path = server.uri();
+  if (!path.startsWith("/WEB/")) {
+    path = "/WEB" + path;
+  }
+  
+  // Verificar cache
+  String cachedContent, cachedType;
+  if (getCachedFile(path, cachedContent, cachedType)) {
+    server.send(200, cachedType, cachedContent);
+    return;
+  }
+  
+  if (!initSDCard() || !SD.exists(path)) {
+    server.send(404, "text/plain", "Arquivo não encontrado");
+    return;
+  }
+  
+  // Determinar tipo
+  String contentType = "text/plain";
+  if (path.endsWith(".html")) contentType = "text/html";
+  else if (path.endsWith(".css")) contentType = "text/css";
+  else if (path.endsWith(".js")) contentType = "application/javascript";
+  else if (path.endsWith(".png")) contentType = "image/png";
+  else if (path.endsWith(".jpg") || path.endsWith(".jpeg")) contentType = "image/jpeg";
+  else if (path.endsWith(".json")) contentType = "application/json";
+  
+  // Cache headers
+  if (contentType == "text/css" || contentType == "application/javascript" ||
+      contentType == "image/png" || contentType == "image/jpeg") {
+    server.sendHeader("Cache-Control", "max-age=86400");
+  } else {
+    server.sendHeader("Cache-Control", "max-age=60");
+  }
+  
+  File file = SD.open(path);
+  size_t fileSize = file.size();
+  
+  // Cachear arquivos pequenos
+  if (fileSize <= 10240 && contentType != "application/json") {
+    String content = file.readString();
+    file.close();
+    cacheFile(path, content, contentType);
+    server.send(200, contentType, content);
+  } else {
+    // Streaming para arquivos grandes
+    server.setContentLength(fileSize);
+    server.send(200, contentType, "");
+    
+    while (file.available()) {
+      size_t bytesRead = file.read(fileBuffer, FILE_BUFFER_SIZE);
+      server.sendContent((const char*)fileBuffer, bytesRead);
+    }
+    file.close();
+  }
+}
+
+void handleConfigRoot() {
+  if (!initSDCard() || !SD.exists("/WEB/config_adm.html")) {
+    server.send(404, "text/plain", "config_adm.html não encontrado");
+    return;
+  }
+  
+  File file = SD.open("/WEB/config_adm.html");
+  server.streamFile(file, "text/html");
+  file.close();
+}
+
+// =============================================================================
+// API REST - CONFIGURAÇÃO
+// =============================================================================
+
+void handleGetConfig() {
+  Serial.println("[API] GET /api/get-config");
+  
+  StaticJsonDocument<1536> doc;
+  
+  // Ethernet
+  JsonObject eth = doc.createNestedObject("ethernet");
+  eth["ip"] = config.ethIP;
+  
+  // WiFi
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["ssid"] = config.wifiSSID;
+  wifi["password"] = config.wifiPass;
+  wifi["connected"] = (WiFi.status() == WL_CONNECTED);
+  wifi["ip"] = WiFi.localIP().toString();
+  
+  // Backup
+  JsonObject backup = doc.createNestedObject("backup");
+  backup["email"] = config.emailBackup;
+  backup["link"] = config.linkBackup;
+  
+  JsonObject smtp = backup.createNestedObject("smtp");
+  smtp["sender"] = config.emailSender;
+  smtp["password"] = config.emailPass;
+  smtp["recipient"] = config.emailRecipient;
+  smtp["server"] = config.emailServer;
+  smtp["port"] = config.emailPort;
+  
+  // Access Points
+  JsonObject ap = doc.createNestedObject("ap");
+  ap["active"] = true;
+  
+  JsonObject adminAp = doc.createNestedObject("adminAp");
+  adminAp["active"] = configModeActive;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleSaveConfig() {
+  Serial.println("[API] POST /api/save-config");
+  
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  StaticJsonDocument<1536> doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON inválido\"}");
+    return;
+  }
+  
+  // Salvar Ethernet
+  if (doc.containsKey("ethernet") && doc["ethernet"].containsKey("ip")) {
+    saveEthernetConfig(doc["ethernet"]["ip"].as<String>());
+  }
+  
+  // Salvar WiFi
+  if (doc.containsKey("wifi")) {
+    if (doc["wifi"].containsKey("ssid") && doc["wifi"].containsKey("password")) {
+      saveWiFiConfig(doc["wifi"]["ssid"].as<String>(), 
+                     doc["wifi"]["password"].as<String>());
+    }
+  }
+  
+  // Salvar Backup
+  if (doc.containsKey("backup")) {
+    String emailBackup = config.emailBackup;
+    String linkBackup = config.linkBackup;
+    
+    if (doc["backup"].containsKey("email")) {
+      emailBackup = doc["backup"]["email"].as<String>();
+    }
+    if (doc["backup"].containsKey("link")) {
+      linkBackup = doc["backup"]["link"].as<String>();
+    }
+    
+    saveBackupConfig(emailBackup, linkBackup);
+    
+    // Salvar SMTP
+    if (doc["backup"].containsKey("smtp")) {
+      JsonObject smtp = doc["backup"]["smtp"];
+      saveEmailConfig(
+        smtp["sender"].as<String>(),
+        smtp["password"].as<String>(),
+        smtp["recipient"].as<String>(),
+        smtp["server"].as<String>(),
+        smtp["port"].as<unsigned int>()
+      );
+    }
+  }
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Salvo. Reiniciando...\"}");
+  delay(1000);
+  Serial.println("[SYSTEM] Reiniciando...");
+  ESP.restart();
+}
+
+void handleRestoreDefaults() {
+  Serial.println("[API] POST /api/restore-defaults");
+  
+  restoreFactoryDefaults();
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Restaurado. Reiniciando...\"}");
+  delay(1000);
+  Serial.println("[SYSTEM] Reiniciando...");
+  ESP.restart();
+}
+
+void handleScanWifi() {
+  StaticJsonDocument<1024> doc;
+  JsonArray networks = doc.createNestedArray("networks");
+  
+  JsonObject net1 = networks.createNestedObject();
+  net1["ssid"] = "Internet PCP";
+  net1["signal"] = 85;
+  net1["secured"] = true;
+  
+  JsonObject net2 = networks.createNestedObject();
+  net2["ssid"] = "SmartBox_App";
+  net2["signal"] = 100;
+  net2["secured"] = true;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleSendBackupEmail() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc.containsKey("email")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Requisição inválida\"}");
+    return;
+  }
+  
+  String email = doc["email"];
+  String originalRecipient = config.emailRecipient;
+  
+  config.emailRecipient = email;
+  sendDatabaseBackupByEmail();
+  config.emailRecipient = originalRecipient;
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Backup enviado\"}");
+}
+
+void handleSendBackupGithub() {
+  server.send(200, "application/json", "{\"success\":false,\"message\":\"Não implementado\"}");
+}
+
+// =============================================================================
+// API REST - MANIPULAÇÃO DE DADOS
+// =============================================================================
+
+bool loadJsonFile(const String& path, JsonDocument& doc) {
+  if (!initSDCard() || !SD.exists(path)) return false;
+  
+  File file = SD.open(path);
+  if (!file) return false;
+  
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  return !error;
+}
+
+bool saveJsonFile(const String& path, const JsonDocument& doc) {
+  if (!initSDCard()) return false;
+  if (SD.exists(path)) SD.remove(path);
+  
+  File file = SD.open(path, FILE_WRITE);
+  if (!file) return false;
+  
+  bool success = serializeJson(doc, file) > 0;
+  file.close();
+  invalidateCache();
+  return success;
+}
+
+void handleGetItems() {
+  DynamicJsonDocument doc(16384);
+  
+  if (!loadJsonFile("/WEB/database/cadastros.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao carregar\"}");
+    return;
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleAddItem() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  DynamicJsonDocument newItem(2048);
+  if (deserializeJson(newItem, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON inválido\"}");
+    return;
+  }
+  
+  DynamicJsonDocument doc(16384);
+  if (!loadJsonFile("/WEB/database/cadastros.JSON", doc)) {
+    doc.to<JsonArray>();
+  }
+  
+  doc.add(newItem);
+  
+  if (!saveJsonFile("/WEB/database/cadastros.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(201, "application/json", "{\"success\":true,\"message\":\"Item cadastrado\"}");
+}
+
+void handleUpdateItem() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  DynamicJsonDocument updatedItem(2048);
+  if (deserializeJson(updatedItem, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON inválido\"}");
+    return;
+  }
+  
+  String itemId = updatedItem["cod"].as<String>();
+  if (itemId.isEmpty()) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"ID não especificado\"}");
+    return;
+  }
+  
+  DynamicJsonDocument doc(16384);
+  if (!loadJsonFile("/WEB/database/cadastros.JSON", doc)) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Cadastros não encontrados\"}");
+    return;
+  }
+  
+  bool found = false;
+  for (JsonVariant item : doc.as<JsonArray>()) {
+    if (item["cod"].as<String>() == itemId) {
+      for (JsonPair kv : updatedItem.as<JsonObject>()) {
+        item[kv.key()] = kv.value();
+      }
+      found = true;
+      break;
+    }
+  }
+  
+  if (!found) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Item não encontrado\"}");
+    return;
+  }
+  
+  if (!saveJsonFile("/WEB/database/cadastros.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Item atualizado\"}");
+}
+
+void handleDeleteItem() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc.containsKey("id")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"ID não especificado\"}");
+    return;
+  }
+  
+  String itemId = doc["id"].as<String>();
+  
+  DynamicJsonDocument items(16384);
+  if (!loadJsonFile("/WEB/database/cadastros.JSON", items)) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Cadastros não encontrados\"}");
+    return;
+  }
+  
+  JsonArray arr = items.as<JsonArray>();
+  bool found = false;
+  
+  for (size_t i = 0; i < arr.size(); i++) {
+    if (arr[i]["cod"].as<String>() == itemId) {
+      arr.remove(i);
+      found = true;
+      break;
+    }
+  }
+  
+  if (!found) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Item não encontrado\"}");
+    return;
+  }
+  
+  if (!saveJsonFile("/WEB/database/cadastros.JSON", items)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Item excluído\"}");
+}
+
+void handleGetOperators() {
+  DynamicJsonDocument doc(8192);
+  
+  if (!loadJsonFile("/WEB/database/Operadores.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao carregar\"}");
+    return;
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleAddOperator() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  DynamicJsonDocument newOp(1024);
+  if (deserializeJson(newOp, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON inválido\"}");
+    return;
+  }
+  
+  DynamicJsonDocument doc(8192);
+  if (!loadJsonFile("/WEB/database/Operadores.JSON", doc)) {
+    doc.to<JsonArray>();
+  }
+  
+  doc.add(newOp);
+  
+  if (!saveJsonFile("/WEB/database/Operadores.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(201, "application/json", "{\"success\":true,\"message\":\"Operador cadastrado\"}");
+}
+
+void handleUpdateOperator() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  DynamicJsonDocument updatedOp(1024);
+  if (deserializeJson(updatedOp, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"JSON inválido\"}");
+    return;
+  }
+  
+  if (!updatedOp.containsKey("id_operador")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"ID não especificado\"}");
+    return;
+  }
+  
+  int opId = updatedOp["id_operador"].as<int>();
+  
+  DynamicJsonDocument doc(8192);
+  if (!loadJsonFile("/WEB/database/Operadores.JSON", doc)) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Operadores não encontrados\"}");
+    return;
+  }
+  
+  bool found = false;
+  for (JsonVariant op : doc.as<JsonArray>()) {
+    if (op["id_operador"].as<int>() == opId) {
+      for (JsonPair kv : updatedOp.as<JsonObject>()) {
+        op[kv.key()] = kv.value();
+      }
+      found = true;
+      break;
+    }
+  }
+  
+  if (!found) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Operador não encontrado\"}");
+    return;
+  }
+  
+  if (!saveJsonFile("/WEB/database/Operadores.JSON", doc)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Operador atualizado\"}");
+}
+
+void handleDeleteOperator() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc.containsKey("id")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"ID não especificado\"}");
+    return;
+  }
+  
+  int opId = doc["id"].as<int>();
+  
+  DynamicJsonDocument operators(8192);
+  if (!loadJsonFile("/WEB/database/Operadores.JSON", operators)) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Operadores não encontrados\"}");
+    return;
+  }
+  
+  JsonArray arr = operators.as<JsonArray>();
+  bool found = false;
+  
+  for (size_t i = 0; i < arr.size(); i++) {
+    if (arr[i]["id_operador"].as<int>() == opId) {
+      arr.remove(i);
+      found = true;
+      break;
+    }
+  }
+  
+  if (!found) {
+    server.send(404, "application/json", "{\"success\":false,\"message\":\"Operador não encontrado\"}");
+    return;
+  }
+  
+  if (!saveJsonFile("/WEB/database/Operadores.JSON", operators)) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Erro ao salvar\"}");
+    return;
+  }
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Operador excluído\"}");
+}
+
+void handleOpenDrawer() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, server.arg("plain")) || !doc.containsKey("pin")) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"PIN não especificado\"}");
+    return;
+  }
+  
+  String pinCode = doc["pin"].as<String>();
+  Serial.println(pinCode);
+  
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Comando enviado: " + pinCode + "\"}");
+}
+
+// =============================================================================
+// CONFIGURAÇÃO DO SERVIDOR WEB
+// =============================================================================
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  
+  // API de configuração
+  server.on("/api/get-config", HTTP_GET, handleGetConfig);
+  server.on("/api/save-config", HTTP_POST, handleSaveConfig);
+  server.on("/api/restore-defaults", HTTP_POST, handleRestoreDefaults);
+  server.on("/api/scan-wifi", HTTP_GET, handleScanWifi);
+  server.on("/api/send-backup-email", HTTP_POST, handleSendBackupEmail);
+  server.on("/api/send-backup-github", HTTP_POST, handleSendBackupGithub);
+  
+  // API de dados
+  server.on("/api/items", HTTP_GET, handleGetItems);
+  server.on("/api/items/add", HTTP_POST, handleAddItem);
+  server.on("/api/items/update", HTTP_POST, handleUpdateItem);
+  server.on("/api/items/delete", HTTP_POST, handleDeleteItem);
+  
+  server.on("/api/operators", HTTP_GET, handleGetOperators);
+  server.on("/api/operators/add", HTTP_POST, handleAddOperator);
+  server.on("/api/operators/update", HTTP_POST, handleUpdateOperator);
+  server.on("/api/operators/delete", HTTP_POST, handleDeleteOperator);
+  
+  server.on("/api/open-drawer", HTTP_POST, handleOpenDrawer);
+  
+  server.onNotFound(handleFile);
+  
+  server.begin();
+  Serial.println("[WEB] Servidor iniciado");
+}
+
+// =============================================================================
+// FUNÇÕES DE BOTÕES COM DEBOUNCE
+// =============================================================================
+
+bool readButton(int pin, ButtonState& btn) {
+  bool reading = digitalRead(pin);
+  
+  if (reading != btn.lastState) {
+    btn.lastDebounceTime = millis();
+  }
+  
+  if ((millis() - btn.lastDebounceTime) > DEBOUNCE_DELAY) {
+    if (reading != btn.pressed) {
+      btn.pressed = reading;
+      btn.lastState = reading;
+      return (reading == LOW);
+    }
+  }
+  
+  btn.lastState = reading;
+  return false;
+}
+
+bool readButtonLongPress(int pin, ButtonState& btn, unsigned long duration) {
+  bool reading = digitalRead(pin);
+  
+  if (reading == LOW) {
+    if (btn.pressStartTime == 0) {
+      btn.pressStartTime = millis();
+    } else if (millis() - btn.pressStartTime >= duration) {
+      return true;
+    }
+  } else {
+    btn.pressStartTime = 0;
+  }
+  
+  return false;
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n==================================");
+  Serial.println("ESP32 SMARTBOX - INICIANDO");
+  Serial.println("Versão: 2.0 - Gerenciamento de Configurações");
+  Serial.println("==================================");
+  
+  // Configurar pinos
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  
+  // Inicializar cache
+  initCache();
+  Serial.println("[OK] Cache inicializado");
+  
+  // Inicializar credenciais
+  initCredentials();
+  Serial.println("[OK] Credenciais configuradas");
+  
+  // Carregar configurações
+  loadConfig();
+  Serial.println("[OK] Configurações carregadas");
+  
+  // Conectar WiFi
+  if (!connectWiFi()) {
+    Serial.println("[INFO] Iniciando modo configuração");
+    startConfigMode();
+  }
+  
+  // Iniciar servidor
+  setupWebServer();
+  
+  // Info do sistema
+  Serial.println("==================================");
+  Serial.println("SISTEMA PRONTO!");
+  Serial.printf("Memória livre: %d bytes\n", ESP.getFreeHeap());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Acesse: http://%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("Modo Config: http://%s\n", CONFIG_AP_IP.toString().c_str());
+  }
+  Serial.println("==================================");
+}
+
+// =============================================================================
+// LOOP PRINCIPAL
+// =============================================================================
+
+void loop() {
+  // Processar requisições web
+  server.handleClient();
+  
+  // Botão de backup (pressão curta)
+  if (readButton(BUTTON_PIN, btnBackup)) {
+    Serial.println("\n[BTN] Backup solicitado");
+    sendDatabaseBackupByEmail();
+  }
+  
+  // Botão de configuração (pressão longa 3s)
+  if (readButtonLongPress(CONFIG_BUTTON_PIN, btnConfig, 3000) && !configModeActive) {
+    Serial.println("\n[BTN] Modo configuração ativado");
+    startConfigMode();
+    
+    // Aguardar soltar botão
+    while (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+      delay(10);
+    }
+    btnConfig.pressStartTime = 0;
+  }
+  
+  // LED piscante no modo config
+  if (configModeActive) {
+    unsigned long now = millis();
+    if (now - ledLastToggle >= LED_BLINK_INTERVAL) {
+      ledLastToggle = now;
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+    }
+  } else {
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+  
+  // Pequeno delay para não saturar
+  delay(1);
+}
