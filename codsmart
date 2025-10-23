@@ -13,6 +13,7 @@
 #include <ESP_Mail_Client.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <Ping.h>
 
 // =============================================================================
 // DEFINIÇÕES DE HARDWARE
@@ -767,6 +768,21 @@ void handleSendBackupGithub() {
   server.send(200, "application/json", "{\"success\":false,\"message\":\"Não implementado\"}");
 }
 
+void handleCheckInternet() {
+  bool connected = false;
+  
+  // Usar o servidor DNS do Google como teste
+  IPAddress ip(8, 8, 8, 8);
+  connected = Ping.ping(ip, 1);
+  
+  StaticJsonDocument<64> doc;
+  doc["connected"] = connected;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
 // =============================================================================
 // API REST - MANIPULAÇÃO DE DADOS
 // =============================================================================
@@ -1092,6 +1108,7 @@ void setupWebServer() {
   server.on("/api/scan-wifi", HTTP_GET, handleScanWifi);
   server.on("/api/send-backup-email", HTTP_POST, handleSendBackupEmail);
   server.on("/api/send-backup-github", HTTP_POST, handleSendBackupGithub);
+  server.on("/api/check-internet", HTTP_GET, handleCheckInternet);
   
   // API de dados
   server.on("/api/items", HTTP_GET, handleGetItems);
